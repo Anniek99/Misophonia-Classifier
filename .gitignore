@@ -221,3 +221,10 @@ tm_model/
 *.m4a
 *.tflite
 *.png
+
+training_data/
+training_data_augmented/
+training_data_segmented/
+augment_source/
+tfhub_cache/
+compare_finetuned_results.csv
