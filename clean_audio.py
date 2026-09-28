@@ -11,25 +11,18 @@ This script finds where the actual sound events are and exports each one as its
 own clean clip, throwing away the silence and background noise between them.
 It never touches your original files, only writes new copies.
 
-This is an automatic first pass, not the same as FOAMS's approach in their
-documentation, where they listened to every file by ear in Audacity and hand-
-marked onset/offset within 50ms. This script uses volume alone to guess where
-sound is, so it will occasionally get it wrong on quiet sounds or noisy
-recordings. Skim the output folder afterward and delete anything that looks
-wrong. For most files this saves you from clicking through everything by hand,
-which is the whole point.
+Optionally, with --audacity-labels, it also writes a matching Audacity label
+track for every original recording, so you can open the ORIGINAL (uncut) file
+in Audacity, import that label file, and see exactly where the computer thinks
+each sound starts and stops, drawn right on the real waveform. This is how you
+check the automatic segmentation instead of trusting it blindly.
 
 THE ONE SETTING THAT MATTERS: --top-db
-
-Confusing at first, so read this once.
 
   LOWER numbers  = stricter  = only very quiet audio counts as silence
                    = splits MORE aggressively, finds more separate events
   HIGHER numbers = looser    = more audio counts as "not silence"
                    = splits LESS, tends to merge everything into one blob
-
-If your noisy background is getting kept as part of the sound: LOWER the number.
-If one continuous sound is getting chopped into fragments: RAISE the number.
 
 Default is 20, tested against realistic background noise levels. Try 15 if a
 file's background is louder than usual and events are still merging together;
@@ -37,17 +30,17 @@ try 30 if a single continuous sound is getting fragmented into pieces.
 
 RUN
     .venv\\Scripts\\python clean_audio.py --in training_data --out training_data_clean
+    .venv\\Scripts\\python clean_audio.py --in training_data --out training_data_labeled --audacity-labels
 """
 
 import argparse
 import csv
 import os
-import shutil
 import sys
 
 import numpy as np
 
-import run_test as RT   # find_ffmpeg, audio conversion helpers
+import run_test as RT   # find_ffmpeg
 
 AUDIO_EXT = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac", ".mp4",
             ".mov", ".m4v", ".aiff", ".aif")
@@ -81,8 +74,23 @@ def merge_close_intervals(intervals, sr, min_gap_sec):
     return merged
 
 
+def write_audacity_labels(intervals, sr, label_name, out_path):
+    """Audacity's own label-track import format: one line per region,
+    tab-separated start time, end time, label text, both in plain seconds.
+    File > Import > Labels in Audacity reads this directly."""
+    with open(out_path, "w") as f:
+        for i, (start, end) in enumerate(intervals):
+            f.write(f"{start/sr:.3f}\t{end/sr:.3f}\t{label_name}_{i:02d}\n")
+
+
+def _convert(ffmpeg, src, dst):
+    import subprocess
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", src, "-vn",
+                    "-ac", "1", "-ar", "44100", dst], check=True)
+
+
 def clean_one_file(ffmpeg, src_path, out_dir, stem, top_db, pad_sec,
-                   min_gap_sec, min_len_sec):
+                   min_gap_sec, min_len_sec, label_dir=None):
     import librosa
     import soundfile as sf
 
@@ -94,6 +102,11 @@ def clean_one_file(ffmpeg, src_path, out_dir, stem, top_db, pad_sec,
 
     raw_intervals = librosa.effects.split(y, top_db=top_db)
     intervals = merge_close_intervals(raw_intervals, sr, min_gap_sec)
+
+    if label_dir is not None:
+        os.makedirs(label_dir, exist_ok=True)
+        write_audacity_labels(intervals, sr, stem,
+                              os.path.join(label_dir, f"{stem}_labels.txt"))
 
     pad = int(pad_sec * sr)
     written = []
@@ -115,12 +128,6 @@ def clean_one_file(ffmpeg, src_path, out_dir, stem, top_db, pad_sec,
     return written, len(y) / sr
 
 
-def _convert(ffmpeg, src, dst):
-    import subprocess
-    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", src, "-vn",
-                    "-ac", "1", "-ar", "44100", dst], check=True)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="src", required=True,
@@ -129,12 +136,14 @@ def main():
     ap.add_argument("--top-db", type=float, default=20,
                     help="lower = stricter/more splitting, higher = looser/less splitting")
     ap.add_argument("--pad", type=float, default=0.08,
-                    help="seconds of padding kept around each detected event, "
-                         "so the attack/decay of the sound isn't clipped")
+                    help="seconds of padding kept around each detected event")
     ap.add_argument("--min-gap", type=float, default=0.15,
                     help="events closer together than this (seconds) get merged into one")
     ap.add_argument("--min-len", type=float, default=0.2,
-                    help="discard anything shorter than this (seconds), usually a click or pop")
+                    help="discard anything shorter than this (seconds)")
+    ap.add_argument("--audacity-labels", action="store_true",
+                    help="also write an Audacity-compatible label file per "
+                         "source recording, under <out>\\_audacity_labels\\<class>\\")
     args = ap.parse_args()
 
     ffmpeg = RT.find_ffmpeg()
@@ -150,6 +159,8 @@ def main():
         src_dir = os.path.join(args.src, cls)
         out_dir = os.path.join(args.out, cls)
         os.makedirs(out_dir, exist_ok=True)
+        label_dir = (os.path.join(args.out, "_audacity_labels", cls)
+                    if args.audacity_labels else None)
 
         files = find_audio(src_dir)
         total_events = 0
@@ -157,13 +168,11 @@ def main():
             stem = os.path.splitext(f)[0]
             written, duration = clean_one_file(
                 ffmpeg, os.path.join(src_dir, f), out_dir, stem,
-                args.top_db, args.pad, args.min_gap, args.min_len)
-            for row in written:
-                row["class"] = cls
-            manifest.extend(written)
+                args.top_db, args.pad, args.min_gap, args.min_len, label_dir)
             total_events += len(written)
             flag = "  <- check this one" if len(written) == 0 or len(written) > 8 else ""
             print(f"   {f:<40} {duration:5.1f}s -> {len(written)} event(s){flag}")
+            manifest.extend({**row, "class": cls} for row in written)
 
         avg = total_events / len(files) if files else 0
         print(f"{cls:<18}{len(files):>13}{total_events:>14}{avg:>14.1f}")
@@ -178,15 +187,12 @@ def main():
             w.writerows(manifest)
 
     print(f"Manifest: {man_path}")
-    print()
-    print("NEXT: open the output folder and skim it. Delete any clip that looks wrong,")
-    print("especially ones flagged '<- check this one' above (0 events found, or")
-    print("suspiciously many small fragments from one file).")
-    print()
-    print("If a whole class is getting 0 events or way too many, rerun with a")
-    print("different --top-db for just that class rather than adjusting everything:")
-    print(f"    .venv\\Scripts\\python clean_audio.py --in {args.src} --out {args.out}"
-         f" --top-db 20")
+    if args.audacity_labels:
+        print()
+        print(f"Audacity label files: {args.out}\\_audacity_labels\\<class>\\")
+        print("To check one: open the ORIGINAL recording in Audacity, then")
+        print("File > Import > Labels, and pick the matching _labels.txt file.")
+        print("You'll see the computer's guesses drawn on the real waveform.")
 
 
 if __name__ == "__main__":
