@@ -1,3 +1,48 @@
+"""
+fine_tune_yamnet.py  --  Fine-tune YAMNet on your own trigger sounds.
+
+WHAT THIS IS
+
+Follows the official TensorFlow transfer learning tutorial:
+https://www.tensorflow.org/tutorials/audio/transfer_learning_audio
+
+YAMNet is frozen. You never change its weights. Instead:
+  1. Feed each of your audio files through YAMNet.
+  2. Take its 1024-number "embedding" for each ~1 second frame, instead of its
+     521-class prediction. The embedding is YAMNet's internal understanding of
+     the sound, before it gets squeezed down to AudioSet's specific labels.
+  3. Train a small new classifier on those embeddings to recognize YOUR seven
+     classes.
+
+This is different from what run_test.py does. run_test.py asks frozen YAMNet
+"which of your 521 labels is this," then translates the answer with a hand-built
+map. This script asks YAMNet "what do you hear," in its own 1024-number
+language, and trains something new to interpret that answer directly.
+
+WHY THIS NEEDS A DIFFERENT DOWNLOAD
+
+Your yamnet.tflite only outputs 521 class scores. Embeddings are not in it.
+This script needs the FULL YAMNet, which has three outputs: scores, embeddings,
+and a spectrogram. That version only comes from tensorflow_hub, so this script
+downloads it separately and caches it in tfhub_cache/ so it only downloads once.
+
+WHAT TO SET UP FIRST
+
+Create this folder structure and put audio in it:
+
+    training_data/
+      wet_chewing/      (your FOAMS + Freesound wet chewing clips)
+      gulping/
+      fork_scraping/
+      pen_clicking/
+      sniffling/
+
+speech and other are pulled automatically from extra_audio/speech and
+extra_audio/other, since you already have audio there.
+
+Any format works: wav, mp3, m4a, whatever ffmpeg can read. Files do not need to
+be pre-sliced into 1 second clips. Feed it whole recordings; YAMNet slices them
+internally.
 
 REPRODUCIBILITY
 
@@ -19,9 +64,12 @@ RUN
     .venv\\Scripts\\python fine_tune_yamnet.py --seeds 5
         Runs the whole train+evaluate cycle 5 times, once per seed (the
         embeddings are only extracted once since that part is not random).
-        Prints mean and standard deviation of macro F1 and per-class F1
-        across the 5 runs, which is the actual sensitivity of the model to
-        the random starting point, not just one lucky or unlucky run.
+        Prints mean and standard deviation of recall, precision, and F1 for
+        every class (plus macro F1 and accuracy) across the 5 runs, which is
+        the actual sensitivity of the model to the random starting point,
+        not just one lucky or unlucky run. Also saves seed_summary.csv (the
+        table) and seed_results.csv (every seed) next to this script, and
+        prints how many files and one-second pieces each class has.
     .venv\\Scripts\\python fine_tune_yamnet.py --debug-windows fork_scraping
         Saves the actual ~1 second audio windows used for the FIRST source
         file in that class as individual short wav files, each paired with
@@ -59,6 +107,14 @@ VAL_FRACTION = 0.2
 EPOCHS = 30
 BATCH_SIZE = 32
 SEED = 42
+
+# How the standard deviation across seeds is computed.
+#   0 = population std (numpy's default, divides by N). This is what the
+#       first --seeds 5 run used, so keeping it at 0 keeps those numbers.
+#   1 = sample std (divides by N-1). The usual choice when the runs are a
+#       small sample, and about 12% larger with 5 seeds.
+# Either is fine as long as the report says which one it used.
+STD_DDOF = 0
 
 # YAMNet's own documented framing: ~0.96s windows, a new one every ~0.48s.
 # Used only by --debug-windows, to reconstruct approximately which audio
@@ -297,10 +353,15 @@ def class_weights_for(y_idx, n_classes):
 
 def score(y_true, y_pred, classes):
     """Same math as report() below, but returns numbers instead of printing,
-    so multi-seed runs can collect and later average them."""
+    so multi-seed runs can collect and later average them. Tracks recall and
+    precision per class too, not just F1, so a multi-seed summary can report
+    all three together and they stay mathematically consistent with each
+    other (averaging F1 alone while leaving recall/precision from a single
+    run produces a row where the three numbers no longer agree)."""
     present = [c for c in classes if c in set(y_true)]
-    f1s = {}
+    f1s, recs, precs, ns = {}, {}, {}, {}
     for c in present:
+        ns[c] = int((y_true == c).sum())
         tp = int(((y_pred == c) & (y_true == c)).sum())
         fp = int(((y_pred == c) & (y_true != c)).sum())
         fn = int(((y_pred != c) & (y_true == c)).sum())
@@ -308,9 +369,12 @@ def score(y_true, y_pred, classes):
         prec = tp / (tp + fp) if (tp + fp) else 0.0
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
         f1s[c] = f1
+        recs[c] = rec
+        precs[c] = prec
     acc = float((y_true == y_pred).mean())
     macro = sum(f1s.values()) / len(f1s) if f1s else 0.0
-    return {"per_class_f1": f1s, "accuracy": acc, "macro_f1": macro}
+    return {"per_class_f1": f1s, "per_class_recall": recs, "per_class_precision": precs,
+            "per_class_n": ns, "accuracy": acc, "macro_f1": macro}
 
 
 def report(name, y_true, y_pred, classes):
@@ -336,38 +400,146 @@ def report(name, y_true, y_pred, classes):
     print()
 
 
-def print_seed_summary(all_results, classes_order):
-    """Mean +/- standard deviation across N seeds, per class and overall.
-    This is the actual answer to 'why do results vary when rerunning the
-    code': they vary because training itself has random starting points.
-    This shows HOW MUCH they vary, instead of just one run's number."""
-    RT.hr()
-    print(f"SUMMARY ACROSS {len(all_results)} SEEDS (mean +/- std)")
-    RT.hr()
+def summarize_seeds(all_results, classes_order):
+    """Turn the per-seed score dicts into one row per class with mean and std
+    for recall, precision, and F1, plus n and the F1 min/max. Returns a list
+    of dict rows (one per class) and one overall row for macro F1 / accuracy.
+
+    Recall, precision, and F1 are all averaged over the same seeds, so the
+    three numbers in a row come from the same set of runs. The mean F1 will
+    not exactly equal 2*P*R/(P+R) computed from the mean P and mean R, because
+    each seed's F1 was computed from that seed's own numbers first and then
+    averaged."""
     classes_seen = [c for c in classes_order
                     if any(c in r["per_class_f1"] for r in all_results)]
-    header = f"{'class':<16}{'mean F1':>10}{'std':>8}{'min':>8}{'max':>8}"
+    rows = []
+    for c in classes_seen:
+        f1 = np.array([r["per_class_f1"][c] for r in all_results if c in r["per_class_f1"]])
+        rec = np.array([r["per_class_recall"][c] for r in all_results if c in r["per_class_recall"]])
+        prec = np.array([r["per_class_precision"][c] for r in all_results if c in r["per_class_precision"]])
+        n = next(r["per_class_n"][c] for r in all_results if c in r["per_class_n"])
+        rows.append({
+            "class": c, "n_test_pieces": n,
+            "mean_recall": rec.mean(), "std_recall": rec.std(ddof=STD_DDOF),
+            "mean_precision": prec.mean(), "std_precision": prec.std(ddof=STD_DDOF),
+            "mean_f1": f1.mean(), "std_f1": f1.std(ddof=STD_DDOF),
+            "min_f1": f1.min(), "max_f1": f1.max(),
+        })
+    macro = np.array([r["macro_f1"] for r in all_results])
+    acc = np.array([r["accuracy"] for r in all_results])
+    overall = {
+        "mean_macro_f1": macro.mean(), "std_macro_f1": macro.std(ddof=STD_DDOF),
+        "min_macro_f1": macro.min(), "max_macro_f1": macro.max(),
+        "mean_accuracy": acc.mean(), "std_accuracy": acc.std(ddof=STD_DDOF),
+        "min_accuracy": acc.min(), "max_accuracy": acc.max(),
+    }
+    return rows, overall
+
+
+def print_seed_summary(all_results, classes_order):
+    """Print the mean +/- std table across seeds. This is the answer to 'why
+    do results vary when rerunning': training starts from random weights, so
+    each seed lands in a slightly different place. This shows how much."""
+    rows, overall = summarize_seeds(all_results, classes_order)
+    std_name = "population std (ddof=0)" if STD_DDOF == 0 else "sample std (ddof=1)"
+
+    RT.hr()
+    print(f"SUMMARY ACROSS {len(all_results)} SEEDS   (mean and {std_name})")
+    RT.hr()
+    header = (f"{'class':<15}{'n':>5}"
+             f"{'recall':>9}{'std':>6}"
+             f"{'precision':>11}{'std':>6}"
+             f"{'F1':>8}{'std':>7}{'min':>7}{'max':>7}")
     print(header)
     print("-" * len(header))
-    for c in classes_seen:
-        vals = [r["per_class_f1"][c] for r in all_results if c in r["per_class_f1"]]
-        if not vals:
-            continue
-        print(f"{c:<16}{np.mean(vals):>10.3f}{np.std(vals):>8.3f}"
-             f"{np.min(vals):>8.3f}{np.max(vals):>8.3f}")
-    macro_vals = [r["macro_f1"] for r in all_results]
-    acc_vals = [r["accuracy"] for r in all_results]
+    for r in rows:
+        print(f"{r['class']:<15}{r['n_test_pieces']:>5}"
+             f"{r['mean_recall']*100:>8.0f}%{r['std_recall']*100:>5.0f}%"
+             f"{r['mean_precision']*100:>10.0f}%{r['std_precision']*100:>5.0f}%"
+             f"{r['mean_f1']:>8.3f}{r['std_f1']:>7.3f}"
+             f"{r['min_f1']:>7.3f}{r['max_f1']:>7.3f}")
     print("-" * len(header))
-    print(f"{'macro F1':<16}{np.mean(macro_vals):>10.3f}{np.std(macro_vals):>8.3f}"
-         f"{np.min(macro_vals):>8.3f}{np.max(macro_vals):>8.3f}")
-    print(f"accuracy: mean {np.mean(acc_vals)*100:.1f}%  "
-         f"std {np.std(acc_vals)*100:.1f}%  "
-         f"range {np.min(acc_vals)*100:.1f}% to {np.max(acc_vals)*100:.1f}%")
+    print(f"{'macro F1':<15}{'':>5}{'':>9}{'':>6}{'':>11}{'':>6}"
+         f"{overall['mean_macro_f1']:>8.3f}{overall['std_macro_f1']:>7.3f}"
+         f"{overall['min_macro_f1']:>7.3f}{overall['max_macro_f1']:>7.3f}")
+    print(f"accuracy: mean {overall['mean_accuracy']*100:.1f}%   "
+         f"std {overall['std_accuracy']*100:.1f}%   "
+         f"range {overall['min_accuracy']*100:.1f}% to {overall['max_accuracy']*100:.1f}%")
     print()
-    print("A small std means the score barely depends on the random starting")
-    print("point, so one run is representative. A large std means one run")
-    print("alone could be misleadingly lucky or unlucky, and the mean here")
-    print("is the more honest number to report.")
+    print("Recall std and precision std are in percentage points. The std next")
+    print("to F1 is the one that matches a single STD column on a slide.")
+    print()
+    print("n is how many one-second test pieces each class has. It is the same")
+    print("for every seed, because the test videos never change.")
+    print()
+    print("Mean F1 will not exactly equal 2*P*R/(P+R) from the mean P and mean R")
+    print("shown here. Each seed's F1 is computed first, then those are averaged.")
+    print()
+    print("A small std means one run is representative. A large std means one")
+    print("run alone could be lucky or unlucky, so report the mean.")
+    print()
+
+
+def write_seed_csvs(all_results, classes_order, out_dir):
+    """Save two CSVs so the numbers can be pasted into a slide or spreadsheet
+    without retyping. seed_summary.csv is the table above. seed_results.csv
+    has every individual seed's recall, precision, and F1 per class, so
+    anyone can check how the mean and std were built."""
+    import csv
+    rows, overall = summarize_seeds(all_results, classes_order)
+
+    summary_path = os.path.join(out_dir, "seed_summary.csv")
+    with open(summary_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["class", "n_test_pieces",
+                    "mean_recall_pct", "std_recall_pct",
+                    "mean_precision_pct", "std_precision_pct",
+                    "mean_f1", "std_f1", "min_f1", "max_f1"])
+        for r in rows:
+            w.writerow([r["class"], r["n_test_pieces"],
+                        f"{r['mean_recall']*100:.1f}", f"{r['std_recall']*100:.1f}",
+                        f"{r['mean_precision']*100:.1f}", f"{r['std_precision']*100:.1f}",
+                        f"{r['mean_f1']:.4f}", f"{r['std_f1']:.4f}",
+                        f"{r['min_f1']:.4f}", f"{r['max_f1']:.4f}"])
+        w.writerow(["macro_f1", "", "", "", "", "",
+                    f"{overall['mean_macro_f1']:.4f}", f"{overall['std_macro_f1']:.4f}",
+                    f"{overall['min_macro_f1']:.4f}", f"{overall['max_macro_f1']:.4f}"])
+        w.writerow(["std_type", "population (ddof=0)" if STD_DDOF == 0 else "sample (ddof=1)"])
+
+    per_seed_path = os.path.join(out_dir, "seed_results.csv")
+    with open(per_seed_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["seed_value", "class", "n_test_pieces",
+                    "recall_pct", "precision_pct", "f1"])
+        for i, res in enumerate(all_results):
+            for c in classes_order:
+                if c in res["per_class_f1"]:
+                    w.writerow([SEED + i, c, res["per_class_n"][c],
+                                f"{res['per_class_recall'][c]*100:.1f}",
+                                f"{res['per_class_precision'][c]*100:.1f}",
+                                f"{res['per_class_f1'][c]:.4f}"])
+            w.writerow([SEED + i, "macro_f1", "", "", "", f"{res['macro_f1']:.4f}"])
+    return summary_path, per_seed_path
+
+
+def print_dataset_counts(sources, y, src, classes):
+    """How much data each class has: source files, and one-second pieces
+    (embedding rows). Printed once so it can go in a samples-per-class table."""
+    RT.hr()
+    print("DATA PER CLASS (training pool)")
+    RT.hr()
+    header = f"{'class':<16}{'files':>7}{'pieces':>9}"
+    print(header)
+    print("-" * len(header))
+    for c in classes:
+        n_files = len(sources.get(c, []))
+        n_rows = int((y == c).sum())
+        print(f"{c:<16}{n_files:>7}{n_rows:>9}")
+    print("-" * len(header))
+    print(f"{'total':<16}{sum(len(sources.get(c, [])) for c in classes):>7}{len(y):>9}")
+    print()
+    print("A piece is about one second of audio. Every piece takes the label of")
+    print("the folder its file came from.")
     print()
 
 
@@ -535,6 +707,7 @@ def main():
 
     present_classes = [c for c in CLASSES if c in set(y)]
     print(f"\n{len(X)} embedding rows (~1 second each) from {total_files} files.\n")
+    print_dataset_counts(sources, y, src, present_classes)
 
     ovs = None
     try:
@@ -594,6 +767,12 @@ def main():
         print()
 
     print_seed_summary(all_results, present_classes)
+
+    summary_csv, per_seed_csv = write_seed_csvs(all_results, present_classes, HERE)
+    print("Saved the numbers so you don't have to retype them:")
+    print(f"  {summary_csv}   (the table above)")
+    print(f"  {per_seed_csv}   (every seed, every class)")
+    print()
 
     out_dir = os.path.join(HERE, "finetuned_model")
     os.makedirs(out_dir, exist_ok=True)
