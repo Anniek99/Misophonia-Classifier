@@ -10,3 +10,4 @@ soundfile
 statsmodels
 imageio-ffmpeg
 certifi
+setuptools<82
