@@ -6,7 +6,7 @@ It uses Google's YAMNet to turn audio into numbers, then trains a small classifi
 
 ## How to replicate the main result
 
-You need a Windows computer and the data zip from Annie. The audio and videos aren't in this repo because they're large and have their own licenses.
+Need a Windows computer &  the data zip. The audio and videos aren't in this repo because they're large and have their own licenses.
 
 **1. Install Python.** Run this, then close and reopen the terminal:
 
@@ -98,18 +98,5 @@ To train on a different folder, change `TRAINING_DATA_FOLDER` near the top of `f
 **Test set:** six OVS videos. Vid08 and Vid12 are sniffling, Vid09 is fork scraping, Vid17 is wet chewing, Vid18 is gulping and Vid20 is pen clicking. Test counts are one-second pieces, not videos. Only the five trigger classes are scored, because every test video is a trigger sound and speech and other have no test examples.
 
 The videos come from the Sound-Swapped Video database (https://osf.io/3ysfh/).
-
-## Limits
-
-- The test set is small. Wet chewing has one test video and sniffling has two, so per-class numbers are rough.
-- Speech and other have one training file each. False alarms on everyday sound haven't been measured properly.
-- Results vary between runs because training starts from random weights. The seeds are fixed, and the five-run average is the number to report.
-- Timing was measured on a laptop. Inference time on the Raspberry Pi has to be measured on the Pi.
-
-Earlier experiments are in the git history at the tag `archive-experiments`: audio segmentation, augmentation, Teachable Machine data prep, and the script that built the YAMNet label map in `run_test.py`.
-
-## References
-
-- YAMNet: https://github.com/tensorflow/models/tree/master/research/audioset/yamnet
 - Samermit et al. (2022). Development and evaluation of a sound-swapped video database for misophonia. *Frontiers in Psychology*, 13, 890829.
 - Mahzouni (2025). *Multisensory Temporal Integration of Simple, Neutral, and Trigger Stimuli in Misophonia.* UC Santa Cruz. https://escholarship.org/uc/item/9jd5f5vm
