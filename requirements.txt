@@ -1,0 +1,12 @@
+# Names only, no versions. Once everything runs on your machine, replace this file with the
+# exact versions:  .venv\Scripts\pip freeze > requirements.txt
+tensorflow
+tensorflow-hub
+ai-edge-litert
+numpy
+pandas
+librosa
+soundfile
+statsmodels
+imageio-ffmpeg
+certifi

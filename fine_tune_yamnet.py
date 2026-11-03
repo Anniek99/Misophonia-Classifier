@@ -1,81 +1,19 @@
 """
-fine_tune_yamnet.py  --  Fine-tune YAMNet on your own trigger sounds.
+fine_tune_yamnet.py  --  Train a small classifier on frozen YAMNet embeddings.
 
-WHAT THIS IS
+Each audio file is cut into ~1 second pieces, YAMNet turns each piece into 1024
+numbers, and a small new classifier learns the 7 classes from them (transfer
+learning). The result is scored on the OVS test videos.
 
-Follows the official TensorFlow transfer learning tutorial:
-https://www.tensorflow.org/tutorials/audio/transfer_learning_audio
+Run:
+    python fine_tune_yamnet.py                       one run, fixed seed
+    python fine_tune_yamnet.py --seeds 5             five seeds, mean and std
+    python fine_tune_yamnet.py --debug-windows fork_scraping
+                                                     save one file's windows to listen to
 
-YAMNet is frozen. You never change its weights. Instead:
-  1. Feed each of your audio files through YAMNet.
-  2. Take its 1024-number "embedding" for each ~1 second frame, instead of its
-     521-class prediction. The embedding is YAMNet's internal understanding of
-     the sound, before it gets squeezed down to AudioSet's specific labels.
-  3. Train a small new classifier on those embeddings to recognize YOUR seven
-     classes.
-
-This is different from what run_test.py does. run_test.py asks frozen YAMNet
-"which of your 521 labels is this," then translates the answer with a hand-built
-map. This script asks YAMNet "what do you hear," in its own 1024-number
-language, and trains something new to interpret that answer directly.
-
-WHY THIS NEEDS A DIFFERENT DOWNLOAD
-
-Your yamnet.tflite only outputs 521 class scores. Embeddings are not in it.
-This script needs the FULL YAMNet, which has three outputs: scores, embeddings,
-and a spectrogram. That version only comes from tensorflow_hub, so this script
-downloads it separately and caches it in tfhub_cache/ so it only downloads once.
-
-WHAT TO SET UP FIRST
-
-Create this folder structure and put audio in it:
-
-    training_data/
-      wet_chewing/      (your FOAMS + Freesound wet chewing clips)
-      gulping/
-      fork_scraping/
-      pen_clicking/
-      sniffling/
-
-speech and other are pulled automatically from extra_audio/speech and
-extra_audio/other, since you already have audio there.
-
-Any format works: wav, mp3, m4a, whatever ffmpeg can read. Files do not need to
-be pre-sliced into 1 second clips. Feed it whole recordings; YAMNet slices them
-internally.
-
-REPRODUCIBILITY
-
-Every source of randomness (Python's random module, numpy, and TensorFlow's
-weight initialization / dropout / shuffling) is seeded with SEED below. Same
-training_data folder in, same numbers out, every time you run this.
-
-The train/val SPLIT was already deterministic before this update (it had its
-own seed=42). What was NOT seeded before was everything inside training itself:
-how the classifier's weights start, which dropout connections get switched off
-each round, and what order batches get shuffled in. Those are now seeded too.
-
-This does not make two DIFFERENT training_data folders produce the same score.
-It makes the SAME folder produce the same score every time, which is what
-"reproducible" means here.
-
-RUN
-    .venv\\Scripts\\python fine_tune_yamnet.py
-    .venv\\Scripts\\python fine_tune_yamnet.py --seeds 5
-        Runs the whole train+evaluate cycle 5 times, once per seed (the
-        embeddings are only extracted once since that part is not random).
-        Prints mean and standard deviation of recall, precision, and F1 for
-        every class (plus macro F1 and accuracy) across the 5 runs, which is
-        the actual sensitivity of the model to the random starting point,
-        not just one lucky or unlucky run. Also saves seed_summary.csv (the
-        table) and seed_results.csv (every seed) next to this script, and
-        prints how many files and one-second pieces each class has.
-    .venv\\Scripts\\python fine_tune_yamnet.py --debug-windows fork_scraping
-        Saves the actual ~1 second audio windows used for the FIRST source
-        file in that class as individual short wav files, each paired with
-        the ground-truth label it was assigned. This makes the "is silence
-        getting labeled as the trigger" question something you can listen
-        to directly, instead of reasoning about it secondhand.
+Needs training_data/<class>/, extra_audio/speech and extra_audio/other, and the
+OVS Videos folder. Saves finetuned_model/. With --seeds it also writes
+seed_summary.csv and seed_results.csv.
 """
 
 import argparse
@@ -108,18 +46,11 @@ EPOCHS = 30
 BATCH_SIZE = 32
 SEED = 42
 
-# How the standard deviation across seeds is computed.
-#   0 = population std (numpy's default, divides by N). This is what the
-#       first --seeds 5 run used, so keeping it at 0 keeps those numbers.
-#   1 = sample std (divides by N-1). The usual choice when the runs are a
-#       small sample, and about 12% larger with 5 seeds.
-# Either is fine as long as the report says which one it used.
+# Std across seeds: 0 = population std (numpy default, used for the reported numbers),
+# 1 = sample std (about 12% larger with 5 seeds). State which one you use.
 STD_DDOF = 0
 
-# YAMNet's own documented framing: ~0.96s windows, a new one every ~0.48s.
-# Used only by --debug-windows, to reconstruct approximately which audio
-# samples produced each embedding row (YAMNet does not hand these back to
-# us directly, it only returns the embeddings).
+# YAMNet's own framing: ~0.96 s windows, a new one every ~0.48 s (only used by --debug-windows).
 YAMNET_WINDOW_SEC = 0.96
 YAMNET_HOP_SEC = 0.48
 YAMNET_SR = 16000
@@ -133,10 +64,7 @@ MODEL_URLS = [
 # ------------------------------------------------------------------ seeding
 
 def set_all_seeds(seed):
-    """Seed every source of randomness this script touches. Call this before
-    building or training the model (does not need to happen before the
-    embedding extraction step, since YAMNet itself is frozen and
-    deterministic; nothing there is affected by the seed)."""
+    """Seed Python, numpy and TensorFlow so the same data gives the same results."""
     import tensorflow as tf
     random.seed(seed)
     np.random.seed(seed)
@@ -146,13 +74,7 @@ def set_all_seeds(seed):
 # ------------------------------------------------------------------ loading
 
 def load_yamnet():
-    """Full YAMNet with embeddings. Not the same file as yamnet.tflite.
-
-    Tries, in order:
-      1. A local folder you downloaded by hand (see the error message below)
-      2. tfhub.dev
-      3. the Kaggle mirror
-    """
+    """Load the full YAMNet (with embeddings): a local folder first, then tfhub.dev, then Kaggle."""
     local = os.path.join(HERE, "yamnet_full_model")
     if os.path.isdir(local) and os.listdir(local):
         print(f"Loading YAMNet from local folder: {local}")
@@ -193,6 +115,7 @@ def load_yamnet():
 # --------------------------------------------------------------- embeddings
 
 def find_files(folder):
+    """List the audio files in a folder."""
     if not os.path.isdir(folder):
         return []
     return [os.path.join(folder, f) for f in sorted(os.listdir(folder))
@@ -200,6 +123,7 @@ def find_files(folder):
 
 
 def audio_to_16k(ffmpeg, path, tmp_wav):
+    """Convert an audio or video file to 16 kHz mono wav with even loudness (YAMNet needs 16 kHz)."""
     import subprocess
     subprocess.run(
         [ffmpeg, "-y", "-loglevel", "error", "-i", path, "-vn",
@@ -217,14 +141,7 @@ def gather_class_sources():
 
 
 def save_debug_windows(wav, n_rows, cls, stem, out_dir):
-    """Slice the already-loaded 16kHz waveform into the same approximate
-    windows YAMNet used to produce n_rows embeddings, and save each one as
-    its own short wav file, named with its index and the ground-truth label
-    every row from this file receives. Also writes a small manifest.txt
-    listing each window's start/end time and its label, so you can see at a
-    glance, for example, that window 00 of a fork_scraping file is silence
-    but is still labeled fork_scraping, the same way every other window
-    from that file is, because labeling happens per FILE, not per window."""
+    """Save each ~1 second window of one file as a wav, plus a manifest of times and labels."""
     import soundfile as sf
     os.makedirs(out_dir, exist_ok=True)
     hop = int(YAMNET_HOP_SEC * YAMNET_SR)
@@ -245,22 +162,14 @@ def save_debug_windows(wav, n_rows, cls, stem, out_dir):
 
 
 def extract_dataset(yamnet, ffmpeg, sources, tmp_dir, debug_class=None, debug_out=None):
-    """Run every file through YAMNet. Returns embeddings, labels, source ids.
-
-    Each file produces several embedding rows, one per ~0.96s internal frame.
-    source_id is the file itself, and every row keeps track of which file it
-    came from. That is what makes an honest train/val split possible: whole
-    files move together, never individual frames.
-
-    If debug_class is set, the FIRST file in that class also gets its windows
-    saved as individual audio files via save_debug_windows, once.
-    """
+    """Run every file through YAMNet. Returns embeddings, labels and one source id per file."""
     import librosa
 
     X, y, src = [], [], []
     tmp_wav = os.path.join(tmp_dir, "extract_tmp.wav")
     debug_done = False
 
+    # Every piece from a file gets that file's class label.
     for cls in CLASSES:
         files = sources[cls]
         if not files:
@@ -323,6 +232,7 @@ def split_by_source(y, src, val_fraction, seed):
 # -------------------------------------------------------------------- model
 
 def build_head(n_classes):
+    """The small classifier: 1024 embedding numbers in, one score per class out."""
     import tensorflow as tf
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(1024,), name="yamnet_embedding"),
@@ -338,9 +248,7 @@ def build_head(n_classes):
 
 
 def class_weights_for(y_idx, n_classes):
-    """Balanced weights, since 'other' will usually have far more frames
-    than a scarce class like gulping. Without this the model just learns to
-    predict whichever class is biggest."""
+    """Weight rare classes more, so the model doesn't just favor the biggest class."""
     counts = np.bincount(y_idx, minlength=n_classes)
     total = counts.sum()
     weights = {}
@@ -352,12 +260,7 @@ def class_weights_for(y_idx, n_classes):
 # ---------------------------------------------------------------- reporting
 
 def score(y_true, y_pred, classes):
-    """Same math as report() below, but returns numbers instead of printing,
-    so multi-seed runs can collect and later average them. Tracks recall and
-    precision per class too, not just F1, so a multi-seed summary can report
-    all three together and they stay mathematically consistent with each
-    other (averaging F1 alone while leaving recall/precision from a single
-    run produces a row where the three numbers no longer agree)."""
+    """Per-class recall, precision and F1, plus accuracy and macro F1, returned as numbers."""
     present = [c for c in classes if c in set(y_true)]
     f1s, recs, precs, ns = {}, {}, {}, {}
     for c in present:
@@ -378,6 +281,7 @@ def score(y_true, y_pred, classes):
 
 
 def report(name, y_true, y_pred, classes):
+    """Print recall, precision and F1 for each class, plus accuracy and macro F1."""
     print(f"--- {name} ---")
     present = [c for c in classes if c in set(y_true)]
     header = f"{'class':<16}{'n':>6}{'recall':>9}{'precision':>11}{'F1':>8}"
@@ -401,15 +305,7 @@ def report(name, y_true, y_pred, classes):
 
 
 def summarize_seeds(all_results, classes_order):
-    """Turn the per-seed score dicts into one row per class with mean and std
-    for recall, precision, and F1, plus n and the F1 min/max. Returns a list
-    of dict rows (one per class) and one overall row for macro F1 / accuracy.
-
-    Recall, precision, and F1 are all averaged over the same seeds, so the
-    three numbers in a row come from the same set of runs. The mean F1 will
-    not exactly equal 2*P*R/(P+R) computed from the mean P and mean R, because
-    each seed's F1 was computed from that seed's own numbers first and then
-    averaged."""
+    """Mean and std of recall, precision and F1 per class across seeds, plus macro F1 and accuracy."""
     classes_seen = [c for c in classes_order
                     if any(c in r["per_class_f1"] for r in all_results)]
     rows = []
@@ -437,9 +333,7 @@ def summarize_seeds(all_results, classes_order):
 
 
 def print_seed_summary(all_results, classes_order):
-    """Print the mean +/- std table across seeds. This is the answer to 'why
-    do results vary when rerunning': training starts from random weights, so
-    each seed lands in a slightly different place. This shows how much."""
+    """Print the mean and std table across seeds."""
     rows, overall = summarize_seeds(all_results, classes_order)
     std_name = "population std (ddof=0)" if STD_DDOF == 0 else "sample std (ddof=1)"
 
@@ -481,10 +375,7 @@ def print_seed_summary(all_results, classes_order):
 
 
 def write_seed_csvs(all_results, classes_order, out_dir):
-    """Save two CSVs so the numbers can be pasted into a slide or spreadsheet
-    without retyping. seed_summary.csv is the table above. seed_results.csv
-    has every individual seed's recall, precision, and F1 per class, so
-    anyone can check how the mean and std were built."""
+    """Save the summary (seed_summary.csv) and every seed's numbers (seed_results.csv)."""
     import csv
     rows, overall = summarize_seeds(all_results, classes_order)
 
@@ -547,13 +438,10 @@ def print_dataset_counts(sources, y, src, classes):
 
 def train_and_evaluate_once(X, y, src, present_classes, seed, ffmpeg, yamnet,
                             ovs_folder, verbose_report=True):
-    """Everything that depends on the random seed: split, build, train,
-    validate, and run the real OVS test. Embeddings (X, y, src) are passed
-    in already extracted, since extraction itself is not random and should
-    not be repeated per seed. Returns the real-test score dict, or None if
-    there was no OVS folder / no matching videos."""
+    """Split, train, validate and run the OVS test for one seed. Returns the model, classes and test scores."""
     import tensorflow as tf
 
+    # Fix the seeds, then split train and validation by whole file, so pieces of one file never land on both sides.
     set_all_seeds(seed)
 
     train_mask, val_mask = split_by_source(y, src, VAL_FRACTION, seed)
@@ -572,6 +460,7 @@ def train_and_evaluate_once(X, y, src, present_classes, seed, ffmpeg, yamnet,
 
     have_val = len(X_val) > 0
 
+    # Give rare classes more weight so the biggest class doesn't win by default.
     weights = class_weights_for(y_train, len(present_classes))
     if verbose_report:
         print("Class weights (higher = rarer, matters more per mistake):")
@@ -579,6 +468,7 @@ def train_and_evaluate_once(X, y, src, present_classes, seed, ffmpeg, yamnet,
             print(f"   {c:<16} {weights[i]:.2f}")
         print()
 
+    # Build the classifier and train it.
     model = build_head(len(present_classes))
 
     if verbose_report:
@@ -612,6 +502,7 @@ def train_and_evaluate_once(X, y, src, present_classes, seed, ffmpeg, yamnet,
         RT.hr()
         report("fine-tuned YAMNet, validation split", val_true, val_pred, present_classes)
 
+    # Score on the OVS test videos, which the model never saw.
     real_test_score = None
     if ovs_folder:
         if verbose_report:
@@ -626,11 +517,13 @@ def train_and_evaluate_once(X, y, src, present_classes, seed, ffmpeg, yamnet,
                 continue
             key = RT.video_key(f)
             sound = RT.VIDEO_TO_SOUND.get(key)
+            # Skip videos whose sound isn't one of the trained classes.
             if sound not in present_classes:
                 continue
             wav_path = os.path.join(tmp2, f"{key}.wav")
             audio_to_16k(ffmpeg, os.path.join(ovs_folder, f), wav_path)
             wav, _ = librosa.load(wav_path, sr=16000, mono=True)
+            # YAMNet gives one embedding per ~1 second of audio. The classifier labels each one.
             _, emb, _ = yamnet(wav.astype(np.float32))
             preds = np.argmax(model.predict(emb.numpy(), verbose=0), axis=1)
             for p in preds:
@@ -646,6 +539,7 @@ def train_and_evaluate_once(X, y, src, present_classes, seed, ffmpeg, yamnet,
                 print("not the 1 second / 0.5 hop slicing run_test.py uses. Trends are")
                 print("comparable, exact clip counts will not match run_test.py's CSV.")
                 print()
+            # Keep the numbers (not just printed text) so several seeds can be averaged.
             real_test_score = score(t_true, t_pred, present_classes)
         elif verbose_report:
             print("No matching OVS videos found for the classes you trained.\n")
@@ -656,6 +550,7 @@ def train_and_evaluate_once(X, y, src, present_classes, seed, ffmpeg, yamnet,
 # -------------------------------------------------------------------- main
 
 def main():
+    """Get YAMNet embeddings once, train (one seed or several), score on the OVS videos, and save the model."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=1,
                     help="train+evaluate this many times, with different seeds, "
@@ -672,9 +567,11 @@ def main():
     RT.hr()
     print()
 
+    # 1. Load YAMNet.
     yamnet = load_yamnet()
     print("YAMNet loaded.\n")
 
+    # 2. Find the training files, one folder per class.
     sources = gather_class_sources()
     total_files = sum(len(v) for v in sources.values())
     empty = [c for c, v in sources.items() if not v]
@@ -697,6 +594,7 @@ def main():
         print(f"Debug mode: will save example windows from the first "
              f"{args.debug_class} file to debug_windows\\\n")
 
+    # 3. Turn every file into YAMNet embeddings. This is the slow step, and it only runs once.
     print("Extracting embeddings (this is the slow part, be patient)...")
     X, y, src = extract_dataset(yamnet, ffmpeg, sources, tmp,
                                 debug_class=args.debug_class, debug_out=debug_out)
@@ -709,6 +607,7 @@ def main():
     print(f"\n{len(X)} embedding rows (~1 second each) from {total_files} files.\n")
     print_dataset_counts(sources, y, src, present_classes)
 
+    # 4. Find the OVS test videos. Without them there is no real test.
     ovs = None
     try:
         ovs = RT.find_ovs_folder()
@@ -749,6 +648,7 @@ def main():
     all_results = []
     last_model = None
     for i in range(args.seeds):
+        # Each run uses the next seed after SEED.
         this_seed = SEED + i
         RT.hr()
         print(f"SEED {i+1}/{args.seeds}  (seed value = {this_seed})")
@@ -766,6 +666,7 @@ def main():
              f"accuracy: {real_score['accuracy']*100:.1f}%")
         print()
 
+    # Mean and std across the seeds. This is the result to report.
     print_seed_summary(all_results, present_classes)
 
     summary_csv, per_seed_csv = write_seed_csvs(all_results, present_classes, HERE)
@@ -774,6 +675,7 @@ def main():
     print(f"  {per_seed_csv}   (every seed, every class)")
     print()
 
+    # Save the last run's model. It's one example run, not the best one.
     out_dir = os.path.join(HERE, "finetuned_model")
     os.makedirs(out_dir, exist_ok=True)
     last_model.save(os.path.join(out_dir, "head.keras"))

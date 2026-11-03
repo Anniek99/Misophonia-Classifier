@@ -1,16 +1,10 @@
 """
-get_yamnet.py  --  Download YAMNet without tensorflow_hub.
+get_yamnet.py  --  Download YAMNet as plain files, without tensorflow_hub.
 
-tensorflow_hub fails a lot on Windows: SSL certificate problems, school network
-filters, and tfhub.dev being deprecated. This skips it and downloads the model
-as a plain file instead. Once it works, the model is saved next to this script
-and never downloads again.
+Saves yamnet.tflite and yamnet_class_map.csv next to this script. If every
+method fails, it prints what went wrong at each step.
 
-RUN:
-    .venv\\Scripts\\python get_yamnet.py
-
-If every method fails, this prints exactly what went wrong at each step, which
-is the useful thing to bring to your mentor.
+Run:  python get_yamnet.py
 """
 
 import os
@@ -34,6 +28,7 @@ CLASSMAP_URLS = [
 
 
 def fetch(urls, dest, label):
+    """Download a file, trying each URL and each SSL setting until one works."""
     if os.path.exists(dest) and os.path.getsize(dest) > 1000:
         print(f"  {label}: already have it ({os.path.getsize(dest)//1024} KB)")
         return True
@@ -50,6 +45,7 @@ def fetch(urls, dest, label):
     unverified.verify_mode = ssl.CERT_NONE
     contexts.append(("no SSL check", unverified))
 
+    # Try each URL with each SSL setting until one downloads.
     for url in urls:
         for cname, ctx in contexts:
             try:
@@ -73,6 +69,7 @@ def fetch(urls, dest, label):
 
 
 def main():
+    """Download the class list and the model, or explain how to get them by hand."""
     print("=" * 70)
     print("Downloading YAMNet")
     print("=" * 70)

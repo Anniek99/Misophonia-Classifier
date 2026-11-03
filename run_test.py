@@ -1,17 +1,12 @@
 """
-run_test.py  --  Test your Teachable Machine model against YAMNet on the OVS videos.
+run_test.py  --  Score Teachable Machine and untrained YAMNet on the OVS test videos.
 
-HOW TO RUN
-----------
-1. Put this file in:   C:\\Users\\owner\\Desktop\\Misophonia-Classifier
-2. Open that folder in VS Code (File > Open Folder)
-3. Open the terminal (Ctrl + `) and run these two lines:
+Also the shared helper module: other scripts import it for ffmpeg, the OVS folder
+lookup, the video-to-class map and clip slicing.
 
-       .venv\\Scripts\\pip install tensorflow tensorflow_hub librosa pandas scikit-learn imageio-ffmpeg
-       .venv\\Scripts\\python run_test.py
-
-That is it. It finds your videos and model on its own.
-No ffmpeg install needed, it comes bundled with imageio-ffmpeg.
+Run:  python run_test.py
+Needs tm_model/ (Teachable Machine export) and the OVS Videos folder. Optional
+extra_audio/ measures false alarms.
 """
 
 import os
@@ -26,18 +21,15 @@ from collections import defaultdict
 warnings.filterwarnings("ignore")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
-# ============================================================================
-# SETTINGS -- the only part you might need to edit
-# ============================================================================
+# ---- Settings ----
 
-# Where things live. The script also searches nearby if these are wrong.
-OVS_FOLDER = r"C:\Users\owner\Desktop\OVS Videos"
+# Test videos and Teachable Machine export. The script also searches nearby folders.
+OVS_FOLDER = "OVS Videos"
 MODEL_FOLDER = "tm_model"
 
-# Optional. Put speech and background clips here to measure FALSE ALARMS.
-#   Misophonia-Classifier\extra_audio\speech\   <- people talking
-#   Misophonia-Classifier\extra_audio\other\    <- room noise, cafe, traffic
-# Any format works: mp3, m4a, wav, whatever.
+# Speech and background clips for measuring false alarms (any audio format):
+#   extra_audio/speech/   people talking
+#   extra_audio/other/    room noise, cafe, traffic
 EXTRA_AUDIO_FOLDER = "extra_audio"
 
 # Folder name -> what your Teachable Machine class might be called.
@@ -68,17 +60,11 @@ VIDEO_TO_SOUND = {
 # Maps YAMNet's 521 AudioSet labels onto sound names.
 # Only sounds your model has a class for get scored.
 YAMNET_MAP = {
-    # DERIVED FROM MEASUREMENT, not guesswork.
-    # tune_yamnet.py ran YAMNet over every clip and recorded which AudioSet
-    # labels actually fired. These are the ones that both scored high AND
-    # make semantic sense. Every name is verified against yamnet_class_map.csv.
-    #
-    # Earlier versions used "Slurp" and "Click", which are NOT AudioSet labels,
-    # so gulping and pen_clicking were scored against nothing and got 0%.
+    # Built from measurement: tune_yamnet.py recorded which AudioSet labels fire for each class.
+    # Every name exists in yamnet_class_map.csv.
     "wet_chewing":   ["Liquid", "Drip", "Fill (with liquid)", "Squish",
                       "Chewing, mastication"],
-    # AudioSet has no swallowing or gulping class. These are the closest
-    # relatives and they are weak. Low scores here are a real finding.
+    # AudioSet has no gulping class. These are weak relatives, so low scores are expected.
     "gulping":       ["Hiccup", "Burping, eructation", "Gargling"],
     "fork_scraping": ["Dishes, pots, and pans", "Cutlery, silverware",
                       "Chink, clink", "Glass"],
@@ -104,6 +90,7 @@ YAMNET_THRESHOLD = 0.0194  # derived by tune_yamnet.py from measured scores
 
 
 def hr(char="="):
+    """Print a divider line."""
     print(char * 78)
 
 
@@ -198,6 +185,7 @@ def extract_clips(ffmpeg, video_path, out_dir, stem):
 
 
 def main():
+    """Slice the OVS videos into 1 second clips, score YAMNet and Teachable Machine on them, and print the results."""
     hr()
     print("TheraPhono: Teachable Machine vs YAMNet on the OVS videos")
     hr()

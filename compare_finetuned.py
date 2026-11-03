@@ -1,33 +1,12 @@
 """
-compare_finetuned.py  --  Untrained YAMNet vs fine-tuned YAMNet, same exact clips.
+compare_finetuned.py  --  Untrained YAMNet vs the trained classifier on identical clips.
 
-WHY THIS SCRIPT EXISTS
+Slices the OVS videos (and extra_audio, for false alarms) into 1 second clips once,
+then scores both models on exactly those clips, with YAMNet loaded once.
 
-Your last two evaluations weren't a clean comparison. run_test.py slices audio
-into fixed 1-second clips with a 0.5 second hop. fine_tune_yamnet.py let YAMNet
-frame the audio on its own internal 0.96s/0.48s schedule instead. Same videos,
-different number of windows pulled out of them: 151 clips one way, 164 the
-other. Any difference in the numbers was partly the models and partly the
-slicing. This script fixes that by slicing every clip exactly once, the same
-way, and running BOTH models over that identical set.
-
-It also fixes a smaller inconsistency: the untrained arm used to load a
-separate yamnet.tflite file, while the fine-tuned arm loaded YAMNet a different
-way through tensorflow_hub. Technically the same model, but two different
-exports of it. This script loads YAMNet ONCE. A single call to it returns both
-the 521 class scores (for the untrained arm) and the 1024-number embedding (for
-the fine-tuned arm), so there's no question that any difference between the two
-comes from the training, not from which copy of YAMNet answered.
-
-RUN
-    .venv\\Scripts\\python compare_finetuned.py
-
-NEEDS
-    yamnet_full_model\\   (or working tensorflow_hub download)
-    finetuned_model\\head.keras and classes.txt   (from fine_tune_yamnet.py)
-    yamnet_class_map.csv
-    the OVS videos, and extra_audio\\speech and extra_audio\\other for the
-    false alarm measurement
+Run:  python compare_finetuned.py
+Needs finetuned_model/ (from fine_tune_yamnet.py), yamnet_full_model/ or a working
+tensorflow_hub download, yamnet_class_map.csv, OVS Videos and extra_audio/.
 """
 
 import os
@@ -54,16 +33,7 @@ HOP = 0.5   # matches run_test.py's existing methodology, so this stays
 # ---------------------------------------------------------------- gathering
 
 def gather_clips(ffmpeg, tmp_dir, allowed_classes):
-    """Slice OVS videos + extra_audio into 1-second clips, ONE way, for both
-    models. Returns a DataFrame: clip path, true label, source id.
-
-    Only includes sounds the fine-tuned model actually has a class for.
-    Your OVS folder has 13 different trigger sounds, but the fine-tuned model
-    only has 5, plus speech and other. If a video's sound isn't in the model's
-    class list, the model can never predict it correctly no matter how good it
-    is, so including it would drag the score down for a reason that has
-    nothing to do with model quality. The untrained arm is scored on the exact
-    same restricted set, so both sides face the same, fair test."""
+    """Slice OVS videos and extra_audio into 1 second clips once, for both models. Only sounds the trained model has a class for."""
     rows = []
 
     ovs = None
@@ -108,9 +78,7 @@ def gather_clips(ffmpeg, tmp_dir, allowed_classes):
 # ----------------------------------------------------------------- decision
 
 def untrained_predict(mean_scores, name_to_idx):
-    """Identical logic to run_test.py's own untrained-YAMNet decision rule,
-    reusing the same YAMNET_MAP and YAMNET_THRESHOLD so this arm is not a new
-    or different version of that model, just re-run on matched clips."""
+    """Same decision rule as run_test.py's untrained YAMNet (same YAMNET_MAP and threshold)."""
     best, score = "other", 0.0
     for cls, names in RT.YAMNET_MAP.items():
         valid = [n for n in names if n in name_to_idx]
@@ -125,6 +93,7 @@ def untrained_predict(mean_scores, name_to_idx):
 # ------------------------------------------------------------------ metrics
 
 def report(name, y_true, y_pred, classes):
+    """Print recall, precision and F1 per class, plus accuracy and macro F1. Returns accuracy and macro F1."""
     present = [c for c in classes if c in set(y_true)]
     print(f"--- {name} ---")
     header = f"{'class':<16}{'n':>6}{'recall':>9}{'precision':>11}{'F1':>8}"
@@ -149,6 +118,7 @@ def report(name, y_true, y_pred, classes):
 
 
 def false_alarm_rate(df, pred_col, triggers):
+    """Share of speech and other clips that were wrongly labeled as a trigger."""
     neg = df[df["true_label"].isin(["speech", "other"])]
     if len(neg) == 0:
         return None, 0
@@ -157,6 +127,7 @@ def false_alarm_rate(df, pred_col, triggers):
 
 
 def mcnemar(df, col_a, col_b, name_a, name_b):
+    """Test whether two models' right and wrong answers differ by more than luck."""
     a_ok = df[col_a] == df["true_label"]
     b_ok = df[col_b] == df["true_label"]
     both = int((a_ok & b_ok).sum())
@@ -186,6 +157,7 @@ def mcnemar(df, col_a, col_b, name_a, name_b):
 # -------------------------------------------------------------------- main
 
 def main():
+    """Slice the test clips once, run both models on them, and print the comparison."""
     RT.hr()
     print("Controlled comparison: untrained vs fine-tuned YAMNet")
     print("Same clips, same windowing, same YAMNet load, for both.")
@@ -195,6 +167,7 @@ def main():
     import tensorflow as tf
     import librosa
 
+    # Load YAMNet once. Both models use its output.
     yamnet = FT.load_yamnet()
     print("YAMNet loaded.\n")
 
@@ -209,6 +182,7 @@ def main():
     if not (os.path.exists(head_path) and os.path.exists(classes_path)):
         sys.exit("Missing finetuned_model\\head.keras or classes.txt.\n"
                  "Run fine_tune_yamnet.py first.")
+    # Load the trained classifier saved by fine_tune_yamnet.py.
     head = tf.keras.models.load_model(head_path)
     with open(classes_path) as f:
         ft_classes = [line.strip() for line in f if line.strip()]
@@ -221,6 +195,7 @@ def main():
     print("Slicing every source into 1 second clips, one shared way...")
     print(f"Restricted to the {len(ft_classes)} classes the fine-tuned model "
          f"actually has: {ft_classes}")
+    # Slice every test clip once, so both models see the same clips.
     df = gather_clips(ffmpeg, tmp, set(ft_classes))
     if df.empty:
         sys.exit("No clips gathered. Check the OVS folder and extra_audio.")
@@ -229,6 +204,7 @@ def main():
     print()
 
     print("Running both models over every clip (one YAMNet call each)...")
+    # One YAMNet call per clip gives both models' answers.
     untrained_preds, finetuned_preds = [], []
     for path in df["clip"]:
         wav, _ = librosa.load(path, sr=16000, mono=True)
@@ -252,6 +228,7 @@ def main():
     RT.hr()
     print("RESULTS, both models on the identical clip set")
     RT.hr()
+    # Scores for each model on the same clips.
     report("untrained YAMNet", df["true_label"], df["untrained"], all_classes)
     report("fine-tuned YAMNet", df["true_label"], df["finetuned"], all_classes)
 
@@ -270,6 +247,7 @@ def main():
     RT.hr()
     print("IS THE DIFFERENCE REAL?")
     RT.hr()
+    # Is the difference bigger than luck? (McNemar test)
     mcnemar(df, "untrained", "finetuned", "untrained", "finetuned")
 
     out = os.path.join(HERE, "compare_finetuned_results.csv")

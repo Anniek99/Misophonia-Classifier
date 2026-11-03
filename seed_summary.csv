@@ -1,8 +1,0 @@
-class,n_test_pieces,mean_recall_pct,std_recall_pct,mean_precision_pct,std_precision_pct,mean_f1,std_f1,min_f1,max_f1
-wet_chewing,33,50.9,13.5,97.4,3.3,0.6554,0.1126,0.4651,0.7931
-gulping,26,69.2,4.9,67.7,10.0,0.6765,0.0234,0.6441,0.7111
-fork_scraping,26,36.9,6.7,43.6,5.9,0.3950,0.0413,0.3404,0.4561
-pen_clicking,27,74.1,12.2,51.2,6.1,0.5962,0.0494,0.5385,0.6774
-sniffling,52,82.7,6.5,79.1,5.8,0.8066,0.0474,0.7523,0.8738
-macro_f1,,,,,,0.6259,0.0242,0.5997,0.6716
-std_type,population (ddof=0)
